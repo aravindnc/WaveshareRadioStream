@@ -1,5 +1,7 @@
 #include "Arduino.h"
-#include "WiFiMulti.h"
+#include <WiFi.h>
+#include <esp_wifi.h>
+#include <HTTPClient.h>
 #include "Audio.h"
 #include "SD_MMC.h"
 #include "FS.h"
@@ -9,6 +11,20 @@
 #include "esp_check.h"
 #include "Wire.h"
 #include "NotoSansBold15.h"
+#include <time.h>
+#include <Preferences.h>
+
+// Uncomment below and put your own SSID/PASS
+#include "arduino_secrets.h"
+
+// Libraries used by this project
+// Note that these are all behind current releases. In particular, the
+// audio library made big changes in callbacks that will require
+// some changes before catching up
+//
+// ESP32-audioI2S 3.4.0 https://github.com/schreibfaul1/ESP32-audioI2S
+// Arduino_GFX 1.6.0 https://github.com/moononournation/Arduino_GFX
+// LovyanGFX 1.2.19 https://github.com/lovyan03/LovyanGFX
 
 #define PA_CTRL 7
 #define I2S_MCLK 8
@@ -24,21 +40,37 @@
 #define EXAMPLE_MCLK_FREQ_HZ (EXAMPLE_SAMPLE_RATE * EXAMPLE_MCLK_MULTIPLE)
 #define EXAMPLE_VOICE_VOLUME (75)
 
+// ---- Configuration Constants ----
+const char* STATIONS_URL = "https://fm.aravindnc.com/stations.txt";
+const unsigned long IDLE_SLEEP_TIMEOUT = 45UL * 60UL * 1000UL; // 45 minutes
+const unsigned long STOPPED_SLEEP_TIMEOUT = 5UL * 60UL * 1000UL; // 5 minutes
+const unsigned long SCREENSAVER_TIMEOUT = 60000; // 60 seconds
+const unsigned long SCREEN_DIM_TIMEOUT = 15000; // 15 seconds
+const int SCREEN_BRIGHTNESS_NORMAL = 90; // 0-255
+const int SCREEN_BRIGHTNESS_DIM = 5;      // 0-255
+const long GMT_OFFSET_SEC = 19800;        // UTC+5:30 (India)
+const int DAYLIGHT_OFFSET_SEC = 0;
+const char* NTP_SERVER = "pool.ntp.org";
+const char* WIFI_SSID = SECRET_SSID;
+const char* WIFI_PASS = SECRET_PASS;
+// ---------------------------------
+
 LGFX_Sprite sprite; 
 LGFX_Sprite sprite2; 
+Preferences preferences; 
 
 String curStation="";
 String songPlaying="";
 long bitrate=0;
 bool connected=false;
+bool isScreensaver=false;
 int songposition=-220;
 float voltage=4.20;
 int batLevel=0;
+unsigned long lastInteraction = 0;
+unsigned long lastAudioTime = 0;
 
 Audio audio;
-WiFiMulti wifiMulti;
-String ssid = "xxxxxxxxx";    // ################### DONT FORGET EDIT THIS
-String password = "xxxxxxxxxx";
 
 bool canDraw=0;
 bool deb=0;
@@ -54,7 +86,7 @@ int d3 = 14;
 
 
 int chosen=0; //current station
-int volume=2;
+int volume=4;
 String letters[3]={"P","S","V"};
 
 unsigned short grays[18];
@@ -63,17 +95,12 @@ unsigned short light;
 
 int g[14]={0};  //graph
 
-#define ns 6 //number of stations max 9
-
-String stations[ns]={
-                "https://discodiamond.radioca.st/autodj",
-                "https://listen.radioking.com/radio/175279/stream/216784",
-                "http://sc6.radiocaroline.net:8040/stream",
-                "https://club-high.rautemusik.fm/;",
-                "http://greece-media.monroe.edu/wgmc.mp3",
-                 "https://audio.radio-banovina.hr:9998/;"
-                 };
-
+struct Station {
+  String name;
+  String url;
+};
+Station station_list[100];
+int ns = 0;
 
 #define GFX_BL 46
 Arduino_DataBus* bus = new Arduino_ESP32SPI(45 /* DC */, 21 /* CS */, 38 /* SCK */, 39 /* MOSI */, -1 /* MISO */);
@@ -101,6 +128,8 @@ static esp_err_t es8311_codec_init(void) {
 }
 
 
+
+
 void setup() {
 
   Serial.begin(115200);
@@ -122,12 +151,16 @@ void setup() {
   gfx->begin();
   gfx->fillScreen(RGB565_BLACK);
 
-  analogWrite(GFX_BL,110);   //SCREEN BRIGHTNESS 0-255
+  analogWrite(GFX_BL, SCREEN_BRIGHTNESS_NORMAL);   //SCREEN BRIGHTNESS 0-255
+  lastInteraction = millis();
+  lastAudioTime = millis();
 
-  gfx->setCursor(2, 20);
-  gfx->setTextSize(2);
-  gfx->setTextColor(RGB565_GREEN);
-  gfx->println("connecting to WI-FI");
+  gfx->setCursor(0, 16);
+  gfx->setTextSize(1);
+  gfx->setTextColor(RGB565_GREEN, BLACK);
+  gfx->println("Connecting to WI-FI");
+  gfx->setCursor(0, 32);
+  gfx->println("Scanning...");
 
   sprite.setColorDepth(16);     // RGB565
   sprite.createSprite(240, 240); 
@@ -143,17 +176,307 @@ void setup() {
 
   sprite2.setTextColor(grays[0],TFT_BLACK);
 
+  // 1.8 Register WiFi Event Listener for verbose diagnostics
+  WiFi.onEvent([](WiFiEvent_t event, WiFiEventInfo_t info) {
+      Serial.printf("WiFi Event: %d\n", (int)event);
+      if (event == ARDUINO_EVENT_WIFI_STA_START) {
+          Serial.println("STA Mode Started");
+      } else if (event == ARDUINO_EVENT_WIFI_STA_CONNECTED) {
+          Serial.println("Connected to AP");
+      } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) {
+          Serial.printf("Disconnected! Reason: %d\n", (int)info.wifi_sta_disconnected.reason);
+      } else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+          Serial.print("Got IP: ");
+          Serial.println(WiFi.localIP().toString());
+      }
+  });
+
+  bool conn_success = false;
+
+  gfx->fillRect(0, 16, 240, 100, RGB565_BLACK);
+  gfx->setCursor(0, 16);
+  gfx->setTextColor(RGB565_GREEN, BLACK);
+  gfx->println("Connecting WiFi:");
+  gfx->setTextColor(RGB565_YELLOW, BLACK);
+  gfx->println(WIFI_SSID);
+  gfx->setTextColor(RGB565_GREEN, BLACK);
+
+  Serial.println("Connecting WiFi...");
+
+  WiFi.disconnect(false);
+  delay(100);
   WiFi.mode(WIFI_STA);
-  wifiMulti.addAP(ssid.c_str(), password.c_str());
-  wifiMulti.run();
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.disconnect(true);
-    wifiMulti.run(); 
+  delay(100);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  int attempts = 0;
+  while (attempts < 60) { // Try for 15 seconds (60 * 250ms)
+      if (WiFi.status() == WL_CONNECTED) {
+          conn_success = true;
+          break;
+      }
+      Serial.printf("[%d] Waiting for connection... Status: %d\n", attempts, WiFi.status());
+      gfx->print(".");
+      delay(250);
+      attempts++;
+
+      // Handle sleep button
+      if (digitalRead(0) == LOW) {
+          gfx->fillRect(0, 80, 240, 40, RGB565_BLACK);
+          gfx->setCursor(0, 80);
+          gfx->setTextColor(RGB565_RED, BLACK);
+          gfx->println("Sleeping...");
+          delay(1000);
+          analogWrite(GFX_BL, 0); // Turn off backlight
+          esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); // Wake up on left button
+          digitalWrite(PA_CTRL, LOW);
+          delay(200);
+          esp_deep_sleep_start();
+      }
+  }
+
+  if (!conn_success) {
+      Serial.println("WiFi Connection Failed.");
+      gfx->fillRect(0, 16, 240, 200, RGB565_BLACK);
+      gfx->setCursor(0, 16);
+      gfx->setTextColor(RGB565_RED, BLACK);
+      gfx->println("WiFi Connection Failed.");
+      gfx->println("Please restart or");
+      gfx->println("check router settings.");
+      gfx->println("");
+      gfx->setTextColor(RGB565_GREEN, BLACK);
+      gfx->println("Press MID to retry,");
+      gfx->println("or LEFT to sleep.");
+      
+      while (true) {
+          if (digitalRead(5) == LOW) { // Mid button to retry
+              gfx->fillRect(0, 80, 240, 40, RGB565_BLACK);
+              gfx->setCursor(0, 80);
+              gfx->println("Retrying...");
+              delay(1000);
+              ESP.restart();
+          }
+          if (digitalRead(0) == LOW) { // Left button to sleep
+              gfx->fillRect(0, 80, 240, 40, RGB565_BLACK);
+              gfx->setCursor(0, 80);
+              gfx->setTextColor(RGB565_RED, BLACK);
+              gfx->println("Sleeping...");
+              delay(1000);
+              analogWrite(GFX_BL, 0); // Turn off backlight
+              esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); // Wake up on left button
+              digitalWrite(PA_CTRL, LOW);
+              delay(200);
+              esp_deep_sleep_start();
+          }
+          delay(50);
+      }
+  }
+
+  Serial.println("\nWiFi connected!");
+  Serial.println(WiFi.localIP());
+  gfx->fillRect(0, 32, 240, 200, RGB565_BLACK);
+  gfx->setCursor(0, 32);
+  gfx->setTextColor(RGB565_GREEN, BLACK);
+  gfx->println("WiFi Connected!");
+  gfx->println(WiFi.localIP().toString());
+  delay(1500);
+configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+
+Serial.println("Fetching remote stations list...");
+HTTPClient http;
+http.begin(STATIONS_URL);
+int httpCode = http.GET();
+if (httpCode == HTTP_CODE_OK) {
+  String payload = http.getString();
+  int lineStart = 0;
+  while(lineStart < payload.length() && ns < 100) {
+    int lineEnd = payload.indexOf('\n', lineStart);
+    if (lineEnd == -1) lineEnd = payload.length();
+    String line = payload.substring(lineStart, lineEnd);
+    line.trim();
+    if (line.length() > 0 && line.indexOf('|') > 0) {
+      int pipeIdx = line.indexOf('|');
+      String sname = line.substring(0, pipeIdx);
+      String surl = line.substring(pipeIdx + 1);
+      sname.trim();
+      surl.trim();
+      
+      // Auto-convert https to http to prevent SSL OOM errors
+      if (surl.startsWith("https://")) {
+          surl.replace("https://", "http://");
+      }
+      
+      station_list[ns].name = sname;
+      station_list[ns].url = surl;
+      ns++;
+    }
+    lineStart = lineEnd + 1;
+  }
+} else {
+  Serial.println("Failed to fetch stations, using fallback.");
+}
+http.end();
+
+if (ns == 0) {
+  station_list[0].name = "Fallback Station";
+  station_list[0].url = "http://air.pc.cdn.bitgravity.com/air/live/pbaudio230/playlist.m3u8";
+  ns = 1;
+}
+
+  // Load last played station from preferences
+  preferences.begin("radio", true);
+  String lastStation = preferences.getString("last_station", "");
+  preferences.end();
+
+  if (lastStation.length() > 0) {
+      for (int i = 0; i < ns; i++) {
+          if (station_list[i].name == lastStation) {
+              chosen = i;
+              break;
+          }
+      }
   }
 
   audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT, I2S_MCLK);
-  audio.setVolume(volume*4); // 0...21
-  audio.connecttohost(stations[0].c_str());
+  audio.setVolume(volume*2); // 0...21
+  audio.connecttohost(station_list[chosen].url.c_str());
+}
+
+void drawScreensaver()
+{
+    sprite.fillSprite(TFT_BLACK);
+    
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 10)) {
+        char timeStr[10];
+        char ampmStr[5];
+        strftime(timeStr, sizeof(timeStr), "%I:%M", &timeinfo);
+        strftime(ampmStr, sizeof(ampmStr), "%p", &timeinfo);
+        
+        // Calculate combined width of (Time in Font 7) + (Gap) + (AM/PM in Font 2)
+        sprite.setFont(&fonts::Font7);
+        int clockWidth = sprite.textWidth(timeStr);
+        
+        sprite.setFont(&fonts::Font2);
+        int ampmWidth = sprite.textWidth(ampmStr);
+        
+        int combinedWidth = clockWidth + 6 + ampmWidth;
+        int clockX = 120 - (combinedWidth / 2);
+        int ampmX = clockX + clockWidth + 6;
+        
+        // Draw time digits (shifted up to y=62 to make room for wrapping station name)
+        sprite.setFont(&fonts::Font7);
+        sprite.setTextDatum(0); // Top Left
+        sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+        sprite.drawString(timeStr, clockX, 62);
+        
+        // Draw AM/PM next to clock
+        sprite.setFont(&fonts::Font2);
+        sprite.setTextDatum(0); // Top Left
+        sprite.setTextColor(grays[4], TFT_BLACK);
+        sprite.drawString(ampmStr, ampmX, 78); // Centered vertically next to clock (y=86 - 8 = 78)
+        
+        // Wrap station name to 1 or 2 lines (truncating line 2 if it still overflows)
+        String line1 = "";
+        String line2 = "";
+        String name = station_list[chosen].name;
+        
+        if (name.length() <= 16) {
+            line1 = name;
+        } else {
+            int splitIdx = -1;
+            // Look for a space character starting from index 18 down to 8
+            for (int k = 18; k >= 8; k--) {
+                if (k < name.length() && name[k] == ' ') {
+                    splitIdx = k;
+                    break;
+                }
+            }
+            if (splitIdx == -1) {
+                splitIdx = 15;
+                if (splitIdx >= name.length()) splitIdx = name.length() - 1;
+            }
+            
+            line1 = name.substring(0, splitIdx);
+            line2 = name.substring(splitIdx);
+            line1.trim();
+            line2.trim();
+            
+            // If the remaining text in line 2 is still too long, truncate it and append "..."
+            if (line2.length() > 15) {
+                line2 = line2.substring(0, 12) + "...";
+            }
+        }
+        
+        // Draw station name lines (manually centered with 2x scaled Font 0 for 8-bit look)
+        sprite.setFont(&fonts::Font0);
+        sprite.setTextSize(2);
+        sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
+        
+        if (line2.length() > 0) {
+            // Draw 2 lines centered at 136 and 160
+            int w1 = sprite.textWidth(line1);
+            sprite.drawString(line1, 120 - (w1 / 2), 128); // 136 - 8 = 128
+            
+            int w2 = sprite.textWidth(line2);
+            sprite.drawString(line2, 120 - (w2 / 2), 152); // 160 - 8 = 152
+        } else {
+            // Draw 1 line centered at 148
+            int w1 = sprite.textWidth(line1);
+            sprite.drawString(line1, 120 - (w1 / 2), 140); // 148 - 8 = 140
+        }
+        sprite.setTextSize(1); // Reset scale
+        
+        // Calculate remaining sleep time
+        unsigned long idleTime = millis() - lastInteraction;
+        unsigned long stoppedTime = millis() - lastAudioTime;
+        unsigned long remainingMs = 0;
+        if (audio.isRunning()) {
+            if (IDLE_SLEEP_TIMEOUT > idleTime) {
+                remainingMs = IDLE_SLEEP_TIMEOUT - idleTime;
+            }
+        } else {
+            unsigned long remIdle = (IDLE_SLEEP_TIMEOUT > idleTime) ? (IDLE_SLEEP_TIMEOUT - idleTime) : 0;
+            unsigned long remStop = (STOPPED_SLEEP_TIMEOUT > stoppedTime) ? (STOPPED_SLEEP_TIMEOUT - stoppedTime) : 0;
+            remainingMs = (remIdle < remStop) ? remIdle : remStop;
+        }
+        unsigned long remainingMins = (remainingMs + 59999) / 60000;
+        char sleepBuf[30];
+        if (remainingMs == 0) {
+            sprintf(sleepBuf, "Sleeping...");
+        } else if (remainingMins == 1) {
+            sprintf(sleepBuf, "Sleeps In: 1 min");
+        } else {
+            sprintf(sleepBuf, "Sleeps In: %lu mins", remainingMins);
+        }
+
+        // Draw sleep timer status below station name (manually centered with 2x scaled Font 0 for 8-bit look)
+        sprite.setFont(&fonts::Font0);
+        sprite.setTextSize(2);
+        int sleepWidth = sprite.textWidth(sleepBuf);
+        int sleepX = 120 - (sleepWidth / 2);
+        sprite.setTextDatum(0); // Use Top-Left alignment to bypass datum reset bugs
+        sprite.setTextColor(grays[4], TFT_BLACK);
+        sprite.drawString(sleepBuf, sleepX, 187); // Centered vertically at 195 (195 - 8 = 187)
+        sprite.setTextSize(1); // Reset scale
+        
+        sprite.setTextDatum(0); // reset to top left
+    } else {
+        sprite.setFont(&fonts::Font2);
+        sprite.setTextDatum(4);
+        sprite.setTextColor(grays[0], TFT_BLACK);
+        sprite.drawString("Syncing Time...", 120, 120);
+        sprite.setTextDatum(0);
+    }
+
+    uint16_t *buf = (uint16_t*)sprite.getBuffer();
+    int total = 240 * 240;
+    for (int i = 0; i < total; i++) {
+        buf[i] = __builtin_bswap16(buf[i]);
+    }
+    gfx->draw16bitRGBBitmap(0, 0, buf, 240, 240);
+    canDraw = 0;
 }
 
 void draw2()
@@ -172,14 +495,32 @@ gray=grays[16];
         // time and grapg frame
         sprite.fillRect(160,20,74,60,BLACK);
         sprite.drawRect(160,20,74,60,light);
-        sprite.fillRect(174,24,5,10,TFT_RED);
-        sprite.fillRect(174,37,5,10,TFT_GREEN);
-       
+        
+        // 1. Draw Wifi signal bars (Row 1: WIFI: <bars>)
+        sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+        sprite.drawString("WIFI:", 165, 24, 1);
 
-        //battery
-          sprite.drawRect(210,36,17,10,TFT_GREEN);
-          sprite.fillRect(212,38,batLevel,6,TFT_GREEN); //bat lvl
-          sprite.fillRect(227,39,2,4,TFT_GREEN);
+        int numBars = 0;
+        if (rssi > -60) numBars = 4;
+        else if (rssi > -70) numBars = 3;
+        else if (rssi > -80) numBars = 2;
+        else if (rssi > -90) numBars = 1;
+        
+        for (int b = 0; b < 4; b++) {
+            uint16_t barColor = (b < numBars) ? TFT_GREEN : grays[4];
+            int barHeight = 3 + (b * 2);
+            sprite.fillRect(204 + (b * 4), 33 - barHeight, 2, barHeight, barColor);
+        }
+
+        // 2. Draw Battery icon & voltage (Row 2: Voltage <battery>)
+        uint16_t batColor = (voltage < 3.4) ? TFT_RED : TFT_GREEN;
+        sprite.setTextColor(batColor, TFT_BLACK);
+        sprite.drawString(String(voltage) + "V", 165, 40, 1);
+
+        sprite.drawRect(204, 40, 15, 8, batColor);
+        int scaledBat = (batLevel * 11) / 13;
+        sprite.fillRect(206, 42, scaledBat, 4, batColor);
+        sprite.fillRect(219, 42, 1, 4, batColor); // battery tip
 
         //bitrate
         sprite.fillRect(160,176,74,16,BLACK);
@@ -187,8 +528,8 @@ gray=grays[16];
 
            //volume bar
         sprite.fillRoundRect(160,140,74,3,2,YELLOW);
-        sprite.fillRoundRect(146+(volume*15),137,14,8,2,grays[2]);
-        sprite.fillRoundRect(149+(volume*15),139,8,4,2,grays[10]);
+        sprite.fillRoundRect(146+((volume*15)/2),137,14,8,2,grays[2]);
+        sprite.fillRoundRect(149+((volume*15)/2),139,8,4,2,grays[10]);
 
          //songplaying frame
         sprite.fillRect(4,212,232,18,BLACK);
@@ -196,7 +537,10 @@ gray=grays[16];
 
         sprite.fillRect(149,20,5,172,grays[11]);
 
-        int sliderPos=12;
+        int sliderPos = 12;
+        if (ns > 1) {
+            sliderPos = 12 + (chosen * 152) / (ns - 1);
+        }
         sprite.fillRect(149,sliderPos+8,5,20,grays[2]);
         sprite.fillRect(151,sliderPos+12,1,12,grays[16]);
 
@@ -218,10 +562,22 @@ gray=grays[16];
        sprite.drawString("WEB",160,2,2);
 
         //station list
-        for(int i=0;i<ns;i++)
+        int visible_stations = 9;
+        int start_idx = chosen - 4;
+        if (start_idx < 0) start_idx = 0;
+        if (ns > visible_stations && start_idx > ns - visible_stations) {
+            start_idx = ns - visible_stations;
+        }
+
+        for(int i = 0; i < visible_stations; i++)
         {
-        if(i==chosen) sprite.setTextColor(TFT_GREEN,TFT_BLACK); else  sprite.setTextColor(TFT_DARKGREEN,TFT_BLACK);
-        sprite.drawString(stations[i].substring(0,20),10,26+(i*19),2);
+            int station_idx = start_idx + i;
+            if (station_idx >= ns) break; // In case ns < visible_stations
+
+            if(station_idx == chosen) sprite.setTextColor(TFT_GREEN,TFT_BLACK); 
+            else sprite.setTextColor(TFT_DARKGREEN,TFT_BLACK);
+            
+            sprite.drawString(station_list[station_idx].name.substring(0,20), 10, 23 + (i * 19), 2);
         }
 
         sprite.setTextColor(grays[0],gray);
@@ -232,26 +588,47 @@ gray=grays[16];
         sprite.setTextColor(grays[6],gray);
         sprite.drawString("SONG PLAYING",6,200,1); 
         sprite.drawString("VOLUME",160,124,1);
-         sprite.setTextColor(grays[10],TFT_BLACK); 
-         sprite.drawString("W",165,24,1); 
-         sprite.drawString("I",165,34,1); 
-         sprite.drawString("F",165,44,1); 
-         sprite.drawString("I",165,54,1); 
-         sprite.setTextColor(TFT_GREEN,TFT_BLACK); 
-         sprite.drawString("BITRATE "+String(bitrate),164,180,1); 
-         sprite.drawString("RSSI:"+String(rssi),183,24,1); 
-          sprite.drawString(String(voltage),183,37,1); 
-         
-         sprite.setTextColor(grays[11],gray); 
-         sprite.drawString("VOLOS PROJECTS 2026",122,200,1); 
+        sprite.setTextColor(TFT_GREEN,TFT_BLACK); 
+        sprite.drawString("BITRATE "+String(bitrate),164,180,1); 
+ 
+
+        // Calculate remaining sleep time
+        unsigned long idleTime = millis() - lastInteraction;
+        unsigned long stoppedTime = millis() - lastAudioTime;
+        unsigned long remainingMs = 0;
+        if (audio.isRunning()) {
+            if (IDLE_SLEEP_TIMEOUT > idleTime) {
+                remainingMs = IDLE_SLEEP_TIMEOUT - idleTime;
+            }
+        } else {
+            unsigned long remIdle = (IDLE_SLEEP_TIMEOUT > idleTime) ? (IDLE_SLEEP_TIMEOUT - idleTime) : 0;
+            unsigned long remStop = (STOPPED_SLEEP_TIMEOUT > stoppedTime) ? (STOPPED_SLEEP_TIMEOUT - stoppedTime) : 0;
+            remainingMs = (remIdle < remStop) ? remIdle : remStop;
+        }
+        unsigned long remainingMins = (remainingMs + 59999) / 60000;
+        char sleepBuf[30];
+        if (remainingMs == 0) {
+            sprintf(sleepBuf, "Sleeping...");
+        } else if (remainingMins == 1) {
+            sprintf(sleepBuf, "Sleep In: 1 min");
+        } else {
+            sprintf(sleepBuf, "Sleep In: %lu mins", remainingMins);
+        }
+
+        sprite.setTextColor(grays[11], gray);
+        sprite.setTextDatum(2); // Top-Right aligned
+        sprite.drawString(sleepBuf, 234, 200, 1); 
+        sprite.setTextDatum(0); // Reset to Top-Left 
 
         //graph
         
-        for(int i=0;i<12;i++){  
-        if(connected)
+        for(int i=0;i<13;i++){  
+        if(connected && audio.isRunning())
         g[i]=random(1,5);
+        else
+        g[i]=0;
         for(int j=0;j<g[i];j++)
-        sprite.fillRect(172+(i*5),71-j*4,4,3,grays[4]);
+        sprite.fillRect(165+(i*5),71-j*4,4,3,grays[4]);
         }
    
 
@@ -325,7 +702,7 @@ void loop() {
   static unsigned long lastRSSI = 0;
    static unsigned long lastSlide = 0;
 
-if (millis() - lastRSSI > 240) {   // every 240 ms
+if (millis() - lastRSSI > 1000) {   // every 1 second
     lastRSSI = millis();
     rssi = WiFi.RSSI();  // očitaj jačinu signala
     measureBatt();
@@ -340,45 +717,123 @@ if (millis() - lastRSSI > 240) {   // every 240 ms
 
 if (millis() - lastSlide > 30) {   // svakih 1 sekundu
     lastSlide = millis();
-    draw3();
+    if (!isScreensaver) draw3();
 }
 
 
+  static unsigned long btn5PressTime = 0;
+  static bool btn5PressedInScreensaver = false;
   if (digitalRead(5) == LOW) {
-  if(deb==0)
-      {
-        deb=1;
-        chosen++;
-        if(chosen==ns) chosen=0;
-        audio.connecttohost(stations[chosen].c_str());
-        canDraw=1;
+      if(deb==0) {
+          deb=1;
+          btn5PressTime = millis();
+          btn5PressedInScreensaver = isScreensaver;
       }
-  }else deb=0;
+      lastInteraction = millis();
+  } else {
+      if (deb==1) {
+          deb=0;
+          if (btn5PressedInScreensaver) {
+              // Just dismiss screensaver, do not change station
+              isScreensaver = false;
+              canDraw = 1;
+          } else {
+              unsigned long pressDuration = millis() - btn5PressTime;
+              if (pressDuration > 500) {
+                  chosen--;
+                  if(chosen<0) chosen=ns-1;
+              } else {
+                  chosen++;
+                  if(chosen>=ns) chosen=0;
+              }
+              songPlaying = "<no metadata>";
+              audio.connecttohost(station_list[chosen].url.c_str());
+              
+              // Save last played station
+              preferences.begin("radio", false);
+              preferences.putString("last_station", station_list[chosen].name);
+              preferences.end();
+              
+              canDraw=1;
+          }
+      }
+  }
 
 
-    if (digitalRead(4) == LOW) {
-  if(deb2==0)
-      {
-        deb2=1;
-        volume++;
-        if(volume==6) volume=1;
-        audio.setVolume(volume*4);
-        canDraw=1;
+  static unsigned long btn4PressTime = 0;
+  static bool btn4PressedInScreensaver = false;
+  if (digitalRead(4) == LOW) {
+      if(deb2==0) {
+          deb2=1;
+          btn4PressTime = millis();
+          btn4PressedInScreensaver = isScreensaver;
       }
-  }else deb2=0;
+      lastInteraction = millis();
+  } else {
+      if (deb2==1) {
+          deb2=0;
+          if (btn4PressedInScreensaver) {
+              // Just dismiss screensaver, do not change volume
+              isScreensaver = false;
+              canDraw = 1;
+          } else {
+              unsigned long pressDuration = millis() - btn4PressTime;
+              if (pressDuration > 500) { // Long press: decrease volume
+                  volume--;
+                  if (volume < 1) volume = 10;
+              } else { // Short press: increase volume
+                  volume++;
+                  if (volume > 10) volume = 1;
+              }
+              audio.setVolume(volume * 2);
+              canDraw = 1;
+          }
+      }
+  }
   
     if (digitalRead(0) == LOW) {
+    lastInteraction = millis();
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); // probudi se kad gumb opet bude LOW
     digitalWrite(PA_CTRL, LOW);
     delay(200);
     esp_deep_sleep_start();
   }
 
+  if (audio.isRunning()) {
+      lastAudioTime = millis();
+  }
+
+  // Sleep and Dimming Logic
+  unsigned long idleTime = millis() - lastInteraction;
+  unsigned long stoppedTime = millis() - lastAudioTime;
+  
+  if (idleTime > IDLE_SLEEP_TIMEOUT || stoppedTime > STOPPED_SLEEP_TIMEOUT) {
+      esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); // Wake up on left button
+      digitalWrite(PA_CTRL, LOW); // Turn off audio amp
+      analogWrite(GFX_BL, 0); // Turn off screen
+      delay(200);
+      esp_deep_sleep_start();
+  } else if (idleTime > SCREENSAVER_TIMEOUT) {
+      isScreensaver = true;
+      analogWrite(GFX_BL, SCREEN_BRIGHTNESS_DIM);
+  } else if (idleTime > SCREEN_DIM_TIMEOUT) {
+      isScreensaver = false;
+      analogWrite(GFX_BL, SCREEN_BRIGHTNESS_DIM);
+  } else {
+      isScreensaver = false;
+      analogWrite(GFX_BL, SCREEN_BRIGHTNESS_NORMAL);
+  }
+
   vTaskDelay(1);
   audio.loop();
 
-   if(canDraw)
-   draw2();
+   if (canDraw) {
+       if (isScreensaver) {
+           drawScreensaver();
+       } else {
+           draw2();
+       }
+   }
 
 }
 
@@ -409,5 +864,3 @@ void audio_bitrate(const char *info) {
   bitrate=(String(info).toInt()/1000);
   
 }
-
-

@@ -1,0 +1,6 @@
+# Ignore the WiFi credentials header file
+winRadio/arduino_secrets.h
+
+# Ignore Arduino IDE compilation build outputs
+build/
+.vscode/
