@@ -10,11 +10,10 @@
 #include "es8311.h"
 #include "esp_check.h"
 #include "Wire.h"
-#include "NotoSansBold15.h"
 #include <time.h>
 #include <Preferences.h>
 
-// Uncomment below and put your own SSID/PASS
+// Uncomment below and put your own WIFI_SSID/WIFI_PASS
 #include "arduino_secrets.h"
 
 // Libraries used by this project
@@ -44,10 +43,10 @@
 const char* STATIONS_URL = "https://fm.aravindnc.com/stations.txt";
 const unsigned long IDLE_SLEEP_TIMEOUT = 45UL * 60UL * 1000UL; // 45 minutes
 const unsigned long STOPPED_SLEEP_TIMEOUT = 5UL * 60UL * 1000UL; // 5 minutes
-const unsigned long SCREENSAVER_TIMEOUT = 60000; // 60 seconds
+const unsigned long SCREENSAVER_TIMEOUT = 30000; // 60 seconds
 const unsigned long SCREEN_DIM_TIMEOUT = 15000; // 15 seconds
 const int SCREEN_BRIGHTNESS_NORMAL = 90; // 0-255
-const int SCREEN_BRIGHTNESS_DIM = 5;      // 0-255
+const int SCREEN_BRIGHTNESS_DIM = 2;      // 0-255
 const long GMT_OFFSET_SEC = 19800;        // UTC+5:30 (India)
 const int DAYLIGHT_OFFSET_SEC = 0;
 const char* NTP_SERVER = "pool.ntp.org";
@@ -166,8 +165,6 @@ void setup() {
   sprite.createSprite(240, 240); 
   sprite2.createSprite(230, 16); 
   
-  sprite.loadFont(NotoSansBold15);
-
      int co = 214;
     for (int i = 0; i < 18; i++) {
     grays[i] = sprite.color565(co, co, co+40);
@@ -351,80 +348,96 @@ void drawScreensaver()
     if (getLocalTime(&timeinfo, 10)) {
         char timeStr[10];
         char ampmStr[5];
-        strftime(timeStr, sizeof(timeStr), "%I:%M", &timeinfo);
+        int hour = timeinfo.tm_hour % 12;
+        if (hour == 0) hour = 12;
+        sprintf(timeStr, "%d:%02d", hour, timeinfo.tm_min);
         strftime(ampmStr, sizeof(ampmStr), "%p", &timeinfo);
-        
-        // Calculate combined width of (Time in Font 7) + (Gap) + (AM/PM in Font 2)
-        sprite.setFont(&fonts::Font7);
+        // Calculate combined width of (Time in Font 0 size 5) + (Gap) + (AM/PM in Font 0 size 2)
+        sprite.setFont(&fonts::Font0);
+        sprite.setTextSize(5);
         int clockWidth = sprite.textWidth(timeStr);
         
-        sprite.setFont(&fonts::Font2);
+        sprite.setFont(&fonts::Font0);
+        sprite.setTextSize(2);
         int ampmWidth = sprite.textWidth(ampmStr);
         
         int combinedWidth = clockWidth + 6 + ampmWidth;
         int clockX = 120 - (combinedWidth / 2);
         int ampmX = clockX + clockWidth + 6;
         
-        // Draw time digits (shifted up to y=62 to make room for wrapping station name)
-        sprite.setFont(&fonts::Font7);
+        // Draw time digits (shifted up to y=42 to make room for wrapping station name)
+        sprite.setFont(&fonts::Font0);
+        sprite.setTextSize(5);
         sprite.setTextDatum(0); // Top Left
         sprite.setTextColor(TFT_GREEN, TFT_BLACK);
-        sprite.drawString(timeStr, clockX, 62);
+        sprite.drawString(timeStr, clockX, 42);
         
         // Draw AM/PM next to clock
-        sprite.setFont(&fonts::Font2);
+        sprite.setFont(&fonts::Font0);
+        sprite.setTextSize(2);
         sprite.setTextDatum(0); // Top Left
         sprite.setTextColor(grays[4], TFT_BLACK);
-        sprite.drawString(ampmStr, ampmX, 78); // Centered vertically next to clock (y=86 - 8 = 78)
+        sprite.drawString(ampmStr, ampmX, 54); // Centered vertically next to clock (y=62 - 8 = 54)
+        sprite.setTextSize(1); // Reset
         
-        // Wrap station name to 1 or 2 lines (truncating line 2 if it still overflows)
+        // Wrap station name to 1 or 2 lines for Size 3 (wrap at 9 characters without breaking words)
         String line1 = "";
         String line2 = "";
         String name = station_list[chosen].name;
-        
-        if (name.length() <= 16) {
-            line1 = name;
-        } else {
-            int splitIdx = -1;
-            // Look for a space character starting from index 18 down to 8
-            for (int k = 18; k >= 8; k--) {
-                if (k < name.length() && name[k] == ' ') {
-                    splitIdx = k;
+        name.trim();
+
+        int pos = 0;
+        while (pos < name.length()) {
+            int nextSpace = name.indexOf(' ', pos);
+            String word;
+            if (nextSpace == -1) {
+                word = name.substring(pos);
+                pos = name.length();
+            } else {
+                word = name.substring(pos, nextSpace);
+                pos = nextSpace + 1;
+            }
+            word.trim();
+            if (word.length() == 0) continue;
+
+            if (line1.length() == 0) {
+                if (word.length() <= 9) {
+                    line1 = word;
+                } else {
+                    line1 = word.substring(0, 9);
+                }
+            } else if (line1.length() + 1 + word.length() <= 9) {
+                line1 += " " + word;
+            } else {
+                if (line2.length() == 0) {
+                    if (word.length() <= 9) {
+                        line2 = word;
+                    } else {
+                        line2 = word.substring(0, 9);
+                    }
+                } else if (line2.length() + 1 + word.length() <= 9) {
+                    line2 += " " + word;
+                } else {
+                    // Word breaks/truncates, so skip it and stop wrapping
                     break;
                 }
             }
-            if (splitIdx == -1) {
-                splitIdx = 15;
-                if (splitIdx >= name.length()) splitIdx = name.length() - 1;
-            }
-            
-            line1 = name.substring(0, splitIdx);
-            line2 = name.substring(splitIdx);
-            line1.trim();
-            line2.trim();
-            
-            // If the remaining text in line 2 is still too long, truncate it and append "..."
-            if (line2.length() > 15) {
-                line2 = line2.substring(0, 12) + "...";
-            }
         }
         
-        // Draw station name lines (manually centered with 2x scaled Font 0 for 8-bit look)
+        // Draw station name lines (manually centered with Size 3 for larger look)
         sprite.setFont(&fonts::Font0);
-        sprite.setTextSize(2);
+        sprite.setTextSize(3);
         sprite.setTextColor(TFT_YELLOW, TFT_BLACK);
         
         if (line2.length() > 0) {
-            // Draw 2 lines centered at 136 and 160
             int w1 = sprite.textWidth(line1);
-            sprite.drawString(line1, 120 - (w1 / 2), 128); // 136 - 8 = 128
+            sprite.drawString(line1, 120 - (w1 / 2), 102);
             
             int w2 = sprite.textWidth(line2);
-            sprite.drawString(line2, 120 - (w2 / 2), 152); // 160 - 8 = 152
+            sprite.drawString(line2, 120 - (w2 / 2), 132);
         } else {
-            // Draw 1 line centered at 148
             int w1 = sprite.textWidth(line1);
-            sprite.drawString(line1, 120 - (w1 / 2), 140); // 148 - 8 = 140
+            sprite.drawString(line1, 120 - (w1 / 2), 117);
         }
         sprite.setTextSize(1); // Reset scale
         
@@ -446,9 +459,9 @@ void drawScreensaver()
         if (remainingMs == 0) {
             sprintf(sleepBuf, "Sleeping...");
         } else if (remainingMins == 1) {
-            sprintf(sleepBuf, "Sleeps In: 1 min");
+            sprintf(sleepBuf, "Sleeps in 1 min");
         } else {
-            sprintf(sleepBuf, "Sleeps In: %lu mins", remainingMins);
+            sprintf(sleepBuf, "Sleeps in %lu mins", remainingMins);
         }
 
         // Draw sleep timer status below station name (manually centered with 2x scaled Font 0 for 8-bit look)
@@ -458,16 +471,18 @@ void drawScreensaver()
         int sleepX = 120 - (sleepWidth / 2);
         sprite.setTextDatum(0); // Use Top-Left alignment to bypass datum reset bugs
         sprite.setTextColor(grays[4], TFT_BLACK);
-        sprite.drawString(sleepBuf, sleepX, 187); // Centered vertically at 195 (195 - 8 = 187)
+        sprite.drawString(sleepBuf, sleepX, 182); // Centered vertically at 190 (190 - 8 = 182)
         sprite.setTextSize(1); // Reset scale
         
         sprite.setTextDatum(0); // reset to top left
     } else {
-        sprite.setFont(&fonts::Font2);
+        sprite.setFont(&fonts::Font0);
+        sprite.setTextSize(2);
         sprite.setTextDatum(4);
         sprite.setTextColor(grays[0], TFT_BLACK);
-        sprite.drawString("Syncing Time...", 120, 120);
+        sprite.drawString("Syncing Time...", 120, 130);
         sprite.setTextDatum(0);
+        sprite.setTextSize(1);
     }
 
     uint16_t *buf = (uint16_t*)sprite.getBuffer();
@@ -481,178 +496,222 @@ void drawScreensaver()
 
 void draw2()
 {
+    sprite.setFont(&fonts::Font0);
+    sprite.setTextSize(1);
 
-sprite.drawString("Hello",20,20,2);
+    gray=grays[16];
+    light=grays[12];
+    sprite.fillRect(0,0,240,240,gray);
+    
+    //stations frame
+    sprite.fillRect(4,20,150,172,BLACK);
+    sprite.drawRect(4,20,150,172,light);
 
-gray=grays[16];
-        light=grays[12];
-        sprite.fillRect(0,0,240,240,gray);
-        
-        //stations frame
-        sprite.fillRect(4,20,150,172,BLACK);
-        sprite.drawRect(4,20,150,172,light);
+    // time and grapg frame
+    sprite.fillRect(160,20,74,60,BLACK);
+    sprite.drawRect(160,20,74,60,light);
+    
+    // 1. Draw Wifi signal bars (Row 1: WIFI: <bars>)
+    sprite.setTextColor(TFT_GREEN, TFT_BLACK);
+    sprite.setTextSize(1);
+    sprite.drawString("WIFI", 165, 26);
 
-        // time and grapg frame
-        sprite.fillRect(160,20,74,60,BLACK);
-        sprite.drawRect(160,20,74,60,light);
-        
-        // 1. Draw Wifi signal bars (Row 1: WIFI: <bars>)
-        sprite.setTextColor(TFT_GREEN, TFT_BLACK);
-        sprite.drawString("WIFI:", 165, 24, 1);
+    int numBars = 0;
+    if (rssi > -60) numBars = 4;
+    else if (rssi > -70) numBars = 3;
+    else if (rssi > -80) numBars = 2;
+    else if (rssi > -90) numBars = 1;
+    
+    for (int b = 0; b < 4; b++) {
+        uint16_t barColor = (b < numBars) ? TFT_GREEN : grays[4];
+        int barHeight = 3 + (b * 2);
+        sprite.fillRect(214 + (b * 4), 35 - barHeight, 2, barHeight, barColor);
+    }
 
-        int numBars = 0;
-        if (rssi > -60) numBars = 4;
-        else if (rssi > -70) numBars = 3;
-        else if (rssi > -80) numBars = 2;
-        else if (rssi > -90) numBars = 1;
-        
-        for (int b = 0; b < 4; b++) {
-            uint16_t barColor = (b < numBars) ? TFT_GREEN : grays[4];
-            int barHeight = 3 + (b * 2);
-            sprite.fillRect(204 + (b * 4), 33 - barHeight, 2, barHeight, barColor);
-        }
+    uint16_t batColor = (voltage < 3.4) ? TFT_RED : TFT_GREEN;
+    sprite.setTextColor(batColor, TFT_BLACK);
+    sprite.setTextSize(1);
+    sprite.drawString(String(voltage) + "V", 165, 42);
 
-        // 2. Draw Battery icon & voltage (Row 2: Voltage <battery>)
-        uint16_t batColor = (voltage < 3.4) ? TFT_RED : TFT_GREEN;
-        sprite.setTextColor(batColor, TFT_BLACK);
-        sprite.drawString(String(voltage) + "V", 165, 40, 1);
+    sprite.drawRect(214, 42, 15, 8, batColor);
+    sprite.fillRect(229, 44, 1, 4, batColor); // battery tip
 
-        sprite.drawRect(204, 40, 15, 8, batColor);
+    if (voltage >= 4.15) {
+        // Draw orange lightning bolt in the middle
+        sprite.fillRect(221, 43, 2, 1, ORANGE);
+        sprite.fillRect(220, 44, 2, 1, ORANGE);
+        sprite.fillRect(219, 45, 4, 1, ORANGE);
+        sprite.fillRect(220, 46, 2, 1, ORANGE);
+        sprite.fillRect(219, 47, 2, 1, ORANGE);
+        sprite.fillRect(218, 48, 1, 1, ORANGE);
+    } else {
         int scaledBat = (batLevel * 11) / 13;
-        sprite.fillRect(206, 42, scaledBat, 4, batColor);
-        sprite.fillRect(219, 42, 1, 4, batColor); // battery tip
+        sprite.fillRect(216, 44, scaledBat, 4, batColor);
+    }
 
-        //bitrate
-        sprite.fillRect(160,176,74,16,BLACK);
-        sprite.drawRect(160,176,74,16,light);
+    //bitrate
+    sprite.fillRect(160,176,74,16,BLACK);
+    sprite.drawRect(160,176,74,16,light);
 
-           //volume bar
-        sprite.fillRoundRect(160,140,74,3,2,YELLOW);
-        sprite.fillRoundRect(146+((volume*15)/2),137,14,8,2,grays[2]);
-        sprite.fillRoundRect(149+((volume*15)/2),139,8,4,2,grays[10]);
+    //volume bar
+    sprite.fillRoundRect(160,140,74,3,2,YELLOW);
+    sprite.fillRoundRect(146+((volume*15)/2),137,14,8,2,grays[2]);
+    sprite.fillRoundRect(149+((volume*15)/2),139,8,4,2,grays[10]);
 
-         //songplaying frame
-        sprite.fillRect(4,212,232,18,BLACK);
-        sprite.drawRect(4,212,232,18,light);
+    //songplaying frame
+    sprite.fillRect(4,212,232,18,BLACK);
+    sprite.drawRect(4,212,232,18,light);
 
-        sprite.fillRect(149,20,5,172,grays[11]);
+    sprite.fillRect(149,20,5,172,grays[11]);
 
-        int sliderPos = 12;
-        if (ns > 1) {
-            sliderPos = 12 + (chosen * 152) / (ns - 1);
-        }
-        sprite.fillRect(149,sliderPos+8,5,20,grays[2]);
-        sprite.fillRect(151,sliderPos+12,1,12,grays[16]);
+    int sliderPos = 12;
+    if (ns > 1) {
+        sliderPos = 12 + (chosen * 152) / (ns - 1);
+    }
+    sprite.fillRect(149,sliderPos+8,5,20,grays[2]);
+    sprite.fillRect(151,sliderPos+12,1,12,grays[16]);
 
-        sprite.fillRect(4,7,150,3,ORANGE);
-       
-        sprite.fillRect(190,5,45,3,ORANGE);
-        sprite.fillRect(160,194,74,1,ORANGE);
-        sprite.fillRect(190,11,45,3,grays[6]);
-        
-       
+    // Split the left header line to leave a gap for "STATIONS"
+    sprite.fillRect(4, 7, 24, 3, ORANGE);
+    sprite.fillRect(131, 7, 23, 3, ORANGE);
+    sprite.fillRect(4, 13, 24, 3, grays[6]);
+    sprite.fillRect(131, 13, 23, 3, grays[6]);
+   
+    // Symmetrical header lines next to WEB
+    sprite.fillRect(160, 7, 16, 3, ORANGE);
+    sprite.fillRect(219, 7, 16, 3, ORANGE);
+    sprite.fillRect(160, 13, 16, 3, grays[6]);
+    sprite.fillRect(219, 13, 16, 3, grays[6]);
+    sprite.fillRect(160, 194, 74, 1, ORANGE);
 
-        //frame top and bot
-        sprite.drawRect(0,0,239,239,light);
-        sprite.fillRect(5,234,230,2,grays[13]);
-        
+    //frame top and bot
+    sprite.drawRect(0,0,239,239,light);
+    sprite.fillRect(5,234,230,2,grays[13]);
 
-       sprite.setTextColor(grays[1],gray);
-       sprite.drawString(" STATIONS ",42,2,2);
-       sprite.drawString("WEB",160,2,2);
+    sprite.setTextColor(grays[1],gray);
+    sprite.setTextSize(2);
+    sprite.drawString("STATIONS",31,2);
+    sprite.drawString("WEB",179,2);
+    sprite.setTextSize(1);
 
-        //station list
-        int visible_stations = 9;
-        int start_idx = chosen - 4;
-        if (start_idx < 0) start_idx = 0;
-        if (ns > visible_stations && start_idx > ns - visible_stations) {
-            start_idx = ns - visible_stations;
-        }
+    //station list
+    int visible_stations = 9;
+    int start_idx = chosen - 4;
+    if (start_idx < 0) start_idx = 0;
+    if (ns > visible_stations && start_idx > ns - visible_stations) {
+        start_idx = ns - visible_stations;
+    }
 
-        for(int i = 0; i < visible_stations; i++)
-        {
-            int station_idx = start_idx + i;
-            if (station_idx >= ns) break; // In case ns < visible_stations
+    sprite.setTextSize(2); // Large Size 2 (16x16 pixels)
+    for(int i = 0; i < visible_stations; i++)
+    {
+        int station_idx = start_idx + i;
+        if (station_idx >= ns) break; // In case ns < visible_stations
 
-            if(station_idx == chosen) sprite.setTextColor(TFT_GREEN,TFT_BLACK); 
-            else sprite.setTextColor(TFT_DARKGREEN,TFT_BLACK);
-            
-            sprite.drawString(station_list[station_idx].name.substring(0,20), 10, 23 + (i * 19), 2);
-        }
-
-        sprite.setTextColor(grays[0],gray);
-        sprite.drawString("INTERNET",160,86); 
-        sprite.setTextColor(TFT_RED,gray);
-        sprite.drawString("RADIO",160,102); 
-
-        sprite.setTextColor(grays[6],gray);
-        sprite.drawString("SONG PLAYING",6,200,1); 
-        sprite.drawString("VOLUME",160,124,1);
-        sprite.setTextColor(TFT_GREEN,TFT_BLACK); 
-        sprite.drawString("BITRATE "+String(bitrate),164,180,1); 
- 
-
-        // Calculate remaining sleep time
-        unsigned long idleTime = millis() - lastInteraction;
-        unsigned long stoppedTime = millis() - lastAudioTime;
-        unsigned long remainingMs = 0;
-        if (audio.isRunning()) {
-            if (IDLE_SLEEP_TIMEOUT > idleTime) {
-                remainingMs = IDLE_SLEEP_TIMEOUT - idleTime;
+        if(station_idx == chosen) {
+            sprite.setTextColor(TFT_GREEN,TFT_BLACK);
+            String name = station_list[station_idx].name;
+            if (name.length() > 11) {
+                int numChars = name.length();
+                int totalSteps = numChars + 4;
+                int step = (millis() / 350) % totalSteps;
+                String scrollText = name + "    " + name;
+                sprite.drawString(scrollText.substring(step, step + 11), 10, 23 + (i * 19));
+            } else {
+                sprite.drawString(name, 10, 23 + (i * 19));
             }
         } else {
-            unsigned long remIdle = (IDLE_SLEEP_TIMEOUT > idleTime) ? (IDLE_SLEEP_TIMEOUT - idleTime) : 0;
-            unsigned long remStop = (STOPPED_SLEEP_TIMEOUT > stoppedTime) ? (STOPPED_SLEEP_TIMEOUT - stoppedTime) : 0;
-            remainingMs = (remIdle < remStop) ? remIdle : remStop;
+            sprite.setTextColor(TFT_DARKGREEN,TFT_BLACK);
+            sprite.drawString(station_list[station_idx].name.substring(0,11), 10, 23 + (i * 19));
         }
-        unsigned long remainingMins = (remainingMs + 59999) / 60000;
-        char sleepBuf[30];
-        if (remainingMs == 0) {
-            sprintf(sleepBuf, "Sleeping...");
-        } else if (remainingMins == 1) {
-            sprintf(sleepBuf, "Sleep In: 1 min");
-        } else {
-            sprintf(sleepBuf, "Sleep In: %lu mins", remainingMins);
+    }
+
+    sprite.setTextSize(1);
+    sprite.setTextDatum(1); // Center align
+    sprite.setTextColor(grays[0],gray);
+    sprite.drawString("INTERNET",197,88); 
+    
+    sprite.setTextSize(2); // Large Size 2 for RADIO
+    sprite.setTextColor(TFT_RED,gray);
+    sprite.drawString("RADIO",197,102); 
+    sprite.setTextDatum(0); // Reset to Top-Left
+    sprite.setTextSize(1); // Reset to Size 1
+
+    sprite.setTextColor(grays[6],gray);
+    sprite.drawString("NOW PLAYING",6,200); 
+    sprite.drawString("VOLUME",160,124);
+    sprite.setTextColor(TFT_GREEN,TFT_BLACK); 
+    sprite.drawString("BITRATE "+String(bitrate),164,180); 
+
+    // Calculate remaining sleep time
+    unsigned long idleTime = millis() - lastInteraction;
+    unsigned long stoppedTime = millis() - lastAudioTime;
+    unsigned long remainingMs = 0;
+    if (audio.isRunning()) {
+        if (IDLE_SLEEP_TIMEOUT > idleTime) {
+            remainingMs = IDLE_SLEEP_TIMEOUT - idleTime;
         }
+    } else {
+        unsigned long remIdle = (IDLE_SLEEP_TIMEOUT > idleTime) ? (IDLE_SLEEP_TIMEOUT - idleTime) : 0;
+        unsigned long remStop = (STOPPED_SLEEP_TIMEOUT > stoppedTime) ? (STOPPED_SLEEP_TIMEOUT - stoppedTime) : 0;
+        remainingMs = (remIdle < remStop) ? remIdle : remStop;
+    }
+    unsigned long remainingMins = (remainingMs + 59999) / 60000;
+    char sleepBuf[30];
+    if (remainingMs == 0) {
+        sprintf(sleepBuf, "Sleep: 0m");
+    } else {
+        sprintf(sleepBuf, "Sleep: %lum", remainingMins);
+    }
 
-        sprite.setTextColor(grays[11], gray);
-        sprite.setTextDatum(2); // Top-Right aligned
-        sprite.drawString(sleepBuf, 234, 200, 1); 
-        sprite.setTextDatum(0); // Reset to Top-Left 
+    sprite.setTextColor(grays[11], gray);
+    sprite.setTextDatum(2); // Top-Right aligned
+    sprite.drawString(sleepBuf, 234, 200); 
+    sprite.setTextDatum(0); // Reset to Top-Left 
 
-        //graph
-        
-        for(int i=0;i<13;i++){  
-        if(connected && audio.isRunning())
-        g[i]=random(1,5);
-        else
-        g[i]=0;
+    //graph
+    for(int i=0;i<13;i++){  
+        if(!connected || !audio.isRunning())
+            g[i]=0;
         for(int j=0;j<g[i];j++)
-        sprite.fillRect(165+(i*5),71-j*4,4,3,grays[4]);
-        }
-   
+            sprite.fillRect(165+(i*5),71-j*4,4,3,grays[4]);
+    }
 
-        sprite.setTextColor(grays[16],grays[5]);
-        //butons
-        for(int i=0;i<3;i++)
-        {
-          sprite.fillRoundRect(160+(i*26),152,22,18,4,grays[5]);
-          sprite.drawString(letters[i],166+(i*26),154); 
-        }
+    sprite.setTextColor(grays[16],grays[5]);
+    //buttons (size 1 GLCD font centered inside container)
+    sprite.setTextSize(1);
+    sprite.setTextDatum(4); // Center-Middle
+    for(int i=0;i<3;i++)
+    {
+      int x = 160 + (i * 26);
+      int y = 152;
+      // 3D Drop Shadow
+      sprite.fillRoundRect(x + 1, y + 1, 22, 18, 4, grays[13]);
+      // Button Body
+      sprite.fillRoundRect(x, y, 22, 18, 4, grays[5]);
+      // Top-Left Highlight
+      sprite.drawFastHLine(x + 3, y, 16, grays[1]);
+      sprite.drawFastVLine(x, y + 3, 12, grays[1]);
+      // Bottom-Right Shadow Bevel
+      sprite.drawFastHLine(x + 3, y + 17, 16, grays[10]);
+      sprite.drawFastVLine(x + 21, y + 3, 12, grays[10]);
+      
+      sprite.drawString(letters[i], x + 9, y + 9); 
+    }
+    sprite.setTextDatum(0); // Reset
+    sprite.setTextSize(1); // Reset
 
-   
+    uint16_t *buf = (uint16_t*)sprite.getBuffer();
+    int total = 240 * 240;
 
-uint16_t *buf = (uint16_t*)sprite.getBuffer();
-int total = 240 * 240;
+    for (int i = 0; i < total; i++) {
+        buf[i] = __builtin_bswap16(buf[i]);
+    }
 
-for (int i = 0; i < total; i++) {
-    buf[i] = __builtin_bswap16(buf[i]);
-}
+    gfx->draw16bitRGBBitmap(0, 0, buf, 240, 240);
 
-gfx->draw16bitRGBBitmap(0, 0, buf, 240, 240);
-
-canDraw=0;
-draw3();
+    canDraw=0;
+    draw3();
 }
 
 
@@ -662,6 +721,8 @@ void draw3()
 {
      songposition--;
      if(songposition<-220) songposition=220;
+     sprite2.setFont(&fonts::Font0);
+     sprite2.setTextSize(1);
      sprite2.fillSprite(TFT_BLACK);  
      sprite2.drawString(songPlaying,songposition,5);  
 
@@ -700,7 +761,9 @@ void loop() {
 
   //measure signal strength
   static unsigned long lastRSSI = 0;
-   static unsigned long lastSlide = 0;
+  static unsigned long lastSlide = 0;
+  static unsigned long lastStationChangeTime = 0;
+  static bool stationChangePending = false;
 
 if (millis() - lastRSSI > 1000) {   // every 1 second
     lastRSSI = millis();
@@ -718,6 +781,21 @@ if (millis() - lastRSSI > 1000) {   // every 1 second
 if (millis() - lastSlide > 30) {   // svakih 1 sekundu
     lastSlide = millis();
     if (!isScreensaver) draw3();
+}
+
+static unsigned long lastScrollUpdate = 0;
+if (!isScreensaver && station_list[chosen].name.length() > 11 && (millis() - lastScrollUpdate > 350)) {
+    lastScrollUpdate = millis();
+    canDraw = 1;
+}
+
+static unsigned long lastEqUpdate = 0;
+if (!isScreensaver && audio.isRunning() && (millis() - lastEqUpdate > 500)) { // 2 FPS
+    lastEqUpdate = millis();
+    for (int i = 0; i < 13; i++) {
+        g[i] = random(1, 5);
+    }
+    canDraw = 1;
 }
 
 
@@ -746,15 +824,10 @@ if (millis() - lastSlide > 30) {   // svakih 1 sekundu
                   chosen++;
                   if(chosen>=ns) chosen=0;
               }
-              songPlaying = "<no metadata>";
-              audio.connecttohost(station_list[chosen].url.c_str());
-              
-              // Save last played station
-              preferences.begin("radio", false);
-              preferences.putString("last_station", station_list[chosen].name);
-              preferences.end();
-              
-              canDraw=1;
+              songPlaying = "Loading...";
+              lastStationChangeTime = millis();
+              stationChangePending = true;
+              canDraw = 1;
           }
       }
   }
@@ -790,7 +863,19 @@ if (millis() - lastSlide > 30) {   // svakih 1 sekundu
           }
       }
   }
-  
+
+    if (stationChangePending && (millis() - lastStationChangeTime > 2000)) {
+        stationChangePending = false;
+        audio.connecttohost(station_list[chosen].url.c_str());
+        
+        // Save last played station
+        preferences.begin("radio", false);
+        preferences.putString("last_station", station_list[chosen].name);
+        preferences.end();
+        
+        canDraw = 1;
+    }
+    
     if (digitalRead(0) == LOW) {
     lastInteraction = millis();
     esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); // probudi se kad gumb opet bude LOW
